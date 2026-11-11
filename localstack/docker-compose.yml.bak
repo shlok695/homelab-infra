@@ -1,0 +1,37 @@
+localstack:
+
+image: localstack/localstack:2026.10.0
+
+container_name: localstack
+
+ports:
+
+- "100.87.225.55:4566:4566"
+
+environment:
+
+- LOCALSTACK_AUTH_TOKEN=$ls-deHUPUBa-fEsi-sIhu-FEJO-4964HEpi10de
+
+- SERVICES=s3,sqs,dynamodb,secretsmanager,events,scheduler,lambda,ses,stepfunctions,iam,sts
+
+- PERSISTENCE=1
+
+- LAMBDA_DOCKER_NETWORK=homelab
+
+volumes:
+
+- /home/shlok/data/localstack:/var/lib/localstack
+
+- /var/run/docker.sock:/var/run/docker.sock
+
+mem_limit: 1g
+
+networks: [homelab]
+
+restart: unless-stopped
+
+networks:
+
+homelab:
+
+external: true
