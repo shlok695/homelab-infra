@@ -8,7 +8,13 @@ name: public-uptime
 on:
   schedule:
     - cron: "*/10 * * * *"   # best-effort: GitHub may start runs late or skip them under load
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      simulate:
+        description: "Test only. 'down' skips probing and reports all routes down (sends a real DOWN to ntfy); run again with 'none' to get RECOVERED."
+        type: choice
+        options: [none, down]
+        default: none
 
 permissions: {}              # nothing by default; granted per job below
 
@@ -27,6 +33,7 @@ jobs:
       CONTEXT: svps/public-uptime
       GH_TOKEN: ${{ github.token }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      SIMULATE: ${{ inputs.simulate || 'none' }}   # empty on schedule -> none
     steps:
       - name: Probe routes and notify on state change
         shell: bash
@@ -63,7 +70,13 @@ jobs:
           # Up to 3 passes, 30 s apart; only routes that failed are retried.
           declare -A reason
           pending=("${ROUTES[@]}")
+          tag=""
+          if [ "$SIMULATE" = down ]; then
+            tag=" (TEST)"; echo "::warning::simulate=down: not probing, reporting all routes down"
+            for r in "${ROUTES[@]}"; do reason[${r%%|*}]=simulated; done
+          fi
           for pass in 1 2 3; do
+            [ "$SIMULATE" = down ] && break
             next=()
             for r in "${pending[@]}"; do
               res=$(check "${r%%|*}" "${r#*|}")
@@ -94,7 +107,7 @@ jobs:
 
           when=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           if [ "$now" = down ] && [ "$prev" != down ]; then
-            notify "svps public DOWN" high rotating_light \
+            notify "svps public DOWN$tag" high rotating_light \
               "From GitHub Actions at $when: $failed. Outside can't reach these routes. Run the runbook (observability-matrix.md section 5); capture evidence before restarting tailscaled."
             echo "Sent DOWN notification"
           elif [ "$now" = up ] && [ "$prev" = down ]; then
@@ -107,6 +120,6 @@ jobs:
 
           # Record state only after a successful notify (set -e), so a failed notify is retried next run.
           state=success; desc="All 8 routes OK at $when"
-          if [ "$now" = down ]; then state=failure; desc="DOWN at $when: $failed"; fi
+          if [ "$now" = down ]; then state=failure; desc="DOWN$tag at $when: $failed"; fi
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -X POST \
             -f state="$state" -f context="$CONTEXT" -f description="${desc:0:140}" > /dev/null
