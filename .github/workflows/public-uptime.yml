@@ -1,0 +1,112 @@
+# Outside-in uptime check for svps public routes (Tailscale Funnel).
+# Runs from GitHub's network, so it tests the real public path, independent of svps's uplink.
+# State (up/down) is stored as a commit status on the default-branch HEAD (context "svps/public-uptime"),
+# so ntfy is only called on a state change. No third-party actions, no checkout.
+# Runbook: ~/monitoring/docs/observability-matrix.md section 5.
+name: public-uptime
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # best-effort: GitHub may start runs late or skip them under load
+  workflow_dispatch: {}
+
+permissions: {}              # nothing by default; granted per job below
+
+concurrency:
+  group: public-uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      statuses: write        # read + write the commit status that holds up/down state
+    env:
+      BASE: https://svps.tail00dff0.ts.net
+      CONTEXT: svps/public-uptime
+      GH_TOKEN: ${{ github.token }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - name: Probe routes and notify on state change
+        shell: bash
+        run: |
+          set -euo pipefail   # never add -x: it would print the ntfy URL
+
+          if [ -z "${NTFY_TOPIC:-}" ]; then echo "::error::NTFY_TOPIC secret is not set"; exit 1; fi
+
+          # path|keyword (fixed-string match on the response body)
+          ROUTES=(
+            '/|Project Hub'
+            '/api/status|"env":"production"'
+            '/ipl|Fantasy IPL'
+            '/repopilot|RepoPilot'
+            '/campuskart|CampusKart'
+            '/aerologistics/|<div id="root">'
+            '/api/health|healthy'
+            '/aerologistics/api/specs/B787-9|max_range_km'
+          )
+
+          # One check: prints "ok" or a short reason. IPv4 only (GitHub-hosted runners have no IPv6).
+          check() {
+            local path=$1 kw=$2 body code rc
+            body=$(mktemp)
+            code=$(curl -4 -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 20 \
+                     -A 'svps-public-uptime (GitHub Actions)' "$BASE$path" 2>/dev/null) && rc=0 || rc=$?
+            if [ "$rc" -ne 0 ]; then echo "curl-exit-$rc"
+            elif [ "$code" != "200" ]; then echo "http-$code"
+            elif ! grep -qF -- "$kw" "$body"; then echo "keyword-missing"
+            else echo ok; fi
+            rm -f "$body"
+          }
+
+          # Up to 3 passes, 30 s apart; only routes that failed are retried.
+          declare -A reason
+          pending=("${ROUTES[@]}")
+          for pass in 1 2 3; do
+            next=()
+            for r in "${pending[@]}"; do
+              res=$(check "${r%%|*}" "${r#*|}")
+              if [ "$res" = ok ]; then unset "reason[${r%%|*}]"; else reason[${r%%|*}]=$res; next+=("$r"); fi
+            done
+            pending=("${next[@]+"${next[@]}"}")
+            [ ${#pending[@]} -eq 0 ] && break
+            [ "$pass" -lt 3 ] && sleep 30
+          done
+
+          failed=""
+          for r in "${pending[@]+"${pending[@]}"}"; do failed+="${r%%|*} (${reason[${r%%|*}]}), "; done
+          failed=${failed%, }
+          now=down; [ -z "$failed" ] && now=up
+          echo "Current state: $now ${failed:+- $failed}"
+
+          # Previous state = latest commit status with our context on this commit (none -> unknown).
+          prev=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/statuses" --paginate \
+                   --jq "[.[] | select(.context==\"$CONTEXT\")][0].state // \"unknown\"" | head -n1)
+          case "$prev" in success) prev=up ;; failure|error) prev=down ;; *) prev=unknown ;; esac
+          echo "Previous state: $prev"
+
+          notify() {  # $1 title, $2 priority, $3 tags, $4 body; URL is never printed
+            curl -fsS -o /dev/null --max-time 20 \
+              -H "Title: $1" -H "Priority: $2" -H "Tags: $3" \
+              --data-binary "$4" "https://ntfy.sh/$NTFY_TOPIC"
+          }
+
+          when=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [ "$now" = down ] && [ "$prev" != down ]; then
+            notify "svps public DOWN" high rotating_light \
+              "From GitHub Actions at $when: $failed. Outside can't reach these routes. Run the runbook (observability-matrix.md section 5); capture evidence before restarting tailscaled."
+            echo "Sent DOWN notification"
+          elif [ "$now" = up ] && [ "$prev" = down ]; then
+            notify "svps public recovered" default white_check_mark \
+              "From GitHub Actions at $when: all 8 public routes OK again. Note the recovery time in the incident notes."
+            echo "Sent RECOVERED notification"
+          else
+            echo "No state change; no notification"
+          fi
+
+          # Record state only after a successful notify (set -e), so a failed notify is retried next run.
+          state=success; desc="All 8 routes OK at $when"
+          if [ "$now" = down ]; then state=failure; desc="DOWN at $when: $failed"; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -X POST \
+            -f state="$state" -f context="$CONTEXT" -f description="${desc:0:140}" > /dev/null
