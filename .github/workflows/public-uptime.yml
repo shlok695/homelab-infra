@@ -7,7 +7,7 @@ name: public-uptime
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # best-effort: GitHub may start runs late or skip them under load
+    - cron: "17 * * * *"     # hourly backup to UptimeRobot (5 min); GitHub throttled */10 to one run every ~6-9 h
   workflow_dispatch:
     inputs:
       simulate:
